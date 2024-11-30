@@ -1,0 +1,864 @@
+---
+title: "ctmle"
+author: "Asantewaa"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(SuperLearner)
+library(randomForest)
+library(ggplot2)
+library(dplyr)
+library(knitr)
+library(tidyr)
+library(broom)
+library(MASS)  
+library(boot)
+library(survey)
+library(tmle)
+library(ctmle)
+library(glm2)
+library(glmnet)
+set.seed(123)   
+```
+
+### Fixed Data
+
+```{r}
+fixed_data <- read.csv("data.csv")
+fixed_data$X <- NULL
+summary(fixed_data)
+```
+
+### Simulation Study 1: low-dimensional, highly correlated covariates
+
+```{r}
+simulation1 <- function(n=1000){
+  mu <- c(0.5, 1)
+  sigma <- matrix(c(2, 1, 1, 1), nrow = 2)  
+  logit <- function(p) log(p / (1 - p))
+  expit <- function(x) 1 / (1 + exp(-x)) 
+  
+  W <- mvrnorm(n, mu = mu, Sigma = sigma)
+  W1 <- W[, 1]
+  W2 <- W[, 2]
+  g0 <- expit(0.5 + 0.25 * W1 + 0.75 * W2)
+  T <- rbinom(n, 1, g0)
+  
+  Q0 <- 1 + T + W1 + 2 * W2
+  epsilon <- rnorm(n, mean = 0, sd = 1) 
+  Y <- Q0 + epsilon
+  
+  data1 <- data.frame(W1 = W1, W2 = W2, T = T, Y = Y)
+  
+  return(data1)
+}
+#write.csv(simulation1(), "data1.csv", row.names = FALSE)
+data1 <- read.csv("data1.csv") #true value = 1
+head(data1)
+```
+
+## Simulation study 2: highly correlated covariates
+
+```{r}
+
+simulation2 <- function(n=1000){
+  W1 <- rbinom(n, 1, 0.5)
+  W2 <- rbinom(n, 1, 0.5)
+  W3 <- rbinom(n, 1, 0.5)
+  W4 <- rbinom(n, 1, 0.2 + 0.5 * W1)
+  W5 <- rbinom(n, 1, 0.05 + 0.3 * W1 + 0.1 * W2 + 0.05 * W3 + 0.4 * W4)
+  W6 <- rbinom(n, 1, 0.2 + 0.6 * W5)
+  W7 <- rbinom(n, 1, 0.5 + 0.2 * W3)
+  W8 <- rbinom(n, 1, 0.1 + 0.2 * W2 + 0.3 * W6 + 0.1 * W7)
+  
+  logit_g0 <- -0.05 + 0.1 * W1 + 0.2 * W2 + 0.2 * W3 - 0.02 * W4 - 0.6 * W5 - 0.2 * W6 - 0.1 * W7
+  g0 <- plogis(-logit_g0) 
+  T <- rbinom(n, 1, g0)
+  
+  epsilon <- rnorm(n, mean = 0, sd = 1) 
+  Y <- 10 + T + W1 + W2 + W4 + 2*W6+ W7 + epsilon
+  
+  data <- data.frame(W1, W2, W3, W4, W5, W6, W7, W8, T, Y)
+  data$g0 <- g0
+  
+  return(data)
+}
+
+#write.csv(simulation2(), "data2.csv", row.names = FALSE)
+data2 <- read.csv("data2.csv") #true value = 1
+head(data2)
+```
+
+## Simulation study 3: Binary outcome with instrumental variable
+
+```{r}
+simulation3 <- function(n=1000) {
+  W1 <- runif(n, 0, 1)
+  W2 <- runif(n, 0, 1)
+  W3 <- runif(n, 0, 1)
+  W4 <- runif(n, 0, 1)
+  g0_1_W <- plogis(-2 + 5 * W1 + 2 * W2 + W3) 
+  
+  T <- rbinom(n, size = 1, prob = g0_1_W)
+
+  Q0 <- plogis(-3 + 2 * W2 + 2 * W3 + W4 + T)
+  
+  Y <- rbinom(n, size = 1, prob = Q0)
+  #Y <- Q0
+  
+  data <- data.frame(W1, W2, W3, W4, T, Y)
+  return(data)
+}
+
+#write.csv(simulation3(), "data3_binary-Y.csv", row.names = FALSE)
+data3 <- read.csv("data3_binary-Y.csv") #true value = 0.2121
+head(data3)
+```
+
+#### DM Estimator and Confidence Intervals
+
+```{r}
+estimate_dm <- function(data, true_value = 1) {
+  treated <- data[data$T == 1, "Y"]
+  control <- data[data$T == 0, "Y"]
+  est <- mean(treated) - mean(control)
+  se <- sqrt(var(treated) / length(treated) + var(control) / length(control))
+  ci <- c(est - 1.96 * se, est + 1.96 * se)
+  
+  bias <- abs(est - true_value)
+  MSE <- bias^2 + se^2
+  list(estimate = est, bias = bias, se = se, mse = MSE, ci_lower = ci[1], ci_upper = ci[2] )
+}
+estimate_dm(data1)
+```
+
+#### OLS Estimator and Confidence Intervals
+
+```{r}
+estimate_ols <- function(data, true_value = 1) {
+  covariates <- colnames(data)[grepl("^W", colnames(data))] 
+  #formula_ols <- as.formula(paste("Y ~ T +", paste(covariates, collapse = " + "), "+ T:(", paste(covariates, collapse = " + "), ")"))
+  #formula_ols <- as.formula(paste("Y ~ T + W1 + W2 + W4 + W6+ W7"))
+  #formula_ols <-  as.formula(paste("Y ~ T + W2 +W3 + W4"))
+  formula_ols <-  as.formula(paste("Y ~ T + W1 +W2"))
+  #formula_ols <-  as.formula(paste("Y ~ T"))
+  model <- lm(formula_ols, data = data)
+  coef_est <- coef(summary(model))["T", ]
+  ci <- confint(model, "T", level = 0.95)
+  se <-  coef_est["Std. Error"]
+  estimate <- coef_est["Estimate"]
+  bias <- abs(estimate - true_value)
+  MSE <- bias^2 + se^2
+  
+  list(estimate = estimate,bias = bias, se = se, mse = MSE, ci_lower = ci[1], ci_upper = ci[2])
+}
+estimate_ols(data1)
+```
+
+#### IPW Estimator and Confidence Intervals
+
+```{r}
+estimate_ipw <- function(data, true_value = 1) {
+  
+  covariates <- colnames(data)[grepl("^W", colnames(data))] 
+  formula_ps <- as.formula(paste("T ~", paste(covariates, collapse = " + ")))  
+  
+  propensity_model <- glm(formula_ps, family = binomial(link = "logit"), data = data)
+  
+  data$weights <- ifelse(data$T == 1, 
+                         1 / predict(propensity_model, type = "response", newdata = data),
+                         1 / (1 - predict(propensity_model, type = "response", newdata = data)))
+  
+  ipw_design <- svydesign(ids = ~1, weights = ~weights, data = data)
+  
+  ipw_result <- svyglm(Y ~ T, design = ipw_design)
+  
+  coef_ipw <- coef(ipw_result)
+  se_ipw <- sqrt(diag(vcov(ipw_result)))
+  bias <- abs(coef_ipw["T"] - true_value)
+  MSE <- bias^2 + se_ipw["T"]^2
+  
+  ci_ipw <- coef_ipw["T"] + c(-1.96, 1.96) * se_ipw["T"]
+  list(estimate = coef_ipw["T"], 
+       bias = bias,
+       se = se_ipw["T"], 
+       mse = MSE,
+       ci_lower = ci_ipw[1], 
+       ci_upper = ci_ipw[2])
+}
+
+estimate_ipw(data1)
+```
+
+The Problematic IPW
+
+```{r}
+estimate_ipw_ <- function(data, true_value = 1) {
+  
+  covariates <- colnames(data)[grepl("^W", colnames(data))]
+  
+  count_table <- table(data$T)
+  data$weights <- ifelse(
+    data$T == 1,
+    count_table["1"] / nrow(data),
+    count_table["0"] / nrow(data)
+  )
+  
+  formula_ipw <- as.formula(paste("Y ~ T +", paste(covariates, collapse = " + ")))
+  
+  ipw_design <- svydesign(ids = ~1, weights = ~weights, data = data)
+
+  ipw_result <- svyglm(Y ~ T, design = ipw_design)
+  
+  coef_ipw <- coef(ipw_result)
+  se_ipw <- sqrt(diag(vcov(ipw_result)))
+  bias <- abs(coef_ipw["T"] - true_value)
+  MSE <- bias^2 + se_ipw["T"]^2
+  
+  ci_ipw <- coef_ipw["T"] + c(-1.96, 1.96) * se_ipw["T"]
+  list(estimate = coef_ipw["T"], 
+       bias = bias,
+       se = se_ipw["T"], 
+       mse = MSE,
+       ci_lower = ci_ipw[1], 
+       ci_upper = ci_ipw[2])
+}
+estimate_ipw_(data1)
+```
+
+### OSE Estimator and Confidence Intervals
+
+```{r}
+estimate_ose <- function(data, true_value = 1) {
+  
+  
+  if(all(data$Y %in% c(0, 1))){
+    q_family <- binomial
+  }else{
+    q_family <- gaussian
+  }
+  
+  covariates <- colnames(data)[grepl("^W", colnames(data))]
+  #formula_q <- as.formula(paste("Y ~ T +", paste(covariates, collapse = " + "), "+ T:(", paste(covariates, collapse = " + "), ")"))
+  #formula_q <- as.formula(paste("Y ~ T + W1 + W2 + W4 + W6+ W7"))
+  #formula_q <-  as.formula(paste("Y ~ T + W2 +W3 + W4"))
+  formula_q <-  as.formula(paste("Y ~ T + W1 +W2"))
+  Q_init <- glm(formula_q, family = q_family, data = data)
+  data$Q0W <- predict(Q_init, newdata = data.frame(T = 0, data[covariates]))
+  data$Q1W <- predict(Q_init, newdata = data.frame(T = 1, data[covariates]))
+  
+  formula_g <- as.formula(paste("T ~", paste(covariates, collapse = " + ")))
+  g_init <- glm(formula_g, family = binomial, data = data)
+  data$g1W <- predict(g_init, type = "response")
+  data$g0W <- 1 - data$g1W
+  
+  data$H1 <- data$T / data$g1W
+  data$H0 <- (1 - data$T) / data$g0W
+  
+  data$IF <- (data$H1 - data$H0) * (data$Y - (data$T * data$Q1W + (1 - data$T) * data$Q0W)) + (data$Q1W - data$Q0W)
+  
+  ATE <- mean(data$IF)
+  SE <- sd(data$IF) / sqrt(nrow(data))
+  CI_lower <- ATE - 1.96 * SE
+  CI_upper <- ATE + 1.96 * SE
+  bias <- abs(ATE - true_value)
+  MSE <- bias^2 + SE^2
+  
+  return(list(estimate = ATE,bias = bias, se = SE, mse= MSE, ci_lower = CI_lower, ci_upper = CI_upper))
+}
+
+estimate_ose(data1)
+
+```
+
+### TMLE Estimator and Confidence Interval
+
+```{r}
+estimate_tmle <- function(data, true_value = 0.212, alpha = 0.05, weight = TRUE, use_single_H = TRUE, transforms = TRUE) {
+  
+  logit <- function(p) {
+    p <- pmax(pmin(p, 0.999), 0.001)
+    return(log(p / (1 - p)))
+  }
+  
+  expit <- function(x) {
+    return(1 / (1 + exp(-x)))
+  }
+  
+  if(all(data$Y %in% c(0, 1))){
+    update_family <- binomial
+    q_family <- binomial
+    outcome <- 'binary'
+  }else if(transforms){
+    a <- min(data$Y)
+    b <- max(data$Y)
+    data$Y <- (data$Y - a) / (b - a)
+    update_family <- quasibinomial
+    q_family <- gaussian
+  }else{
+    update_family <- gaussian
+    q_family <- gaussian
+  }
+  
+  f_offset <- function(x){
+    ifelse(outcome == 'binary', logit(x) , ifelse(transforms, logit(x), x))
+  }
+  
+  f_star <- function(x){
+    ifelse(outcome == 'binary', expit(x) , ifelse(transforms, expit(x), x))
+  }
+  
+  
+  covariates <- colnames(data)[grepl("^W", colnames(data))]
+  #formula_q <- as.formula(paste("Y ~ T +", paste(covariates, collapse = " + "), "+ T:(", paste(covariates, collapse = " + "), ")"))
+  #formula_q <- as.formula(paste("Y ~ T + W1 + W2 + W4 + W6+ W7"))
+  #formula_q <-  as.formula(paste("Y ~ T + W1 +W2"))
+  formula_q <-  as.formula(paste("Y ~ T + W2 +W3 + W4"))
+  Q_init <- glm(formula_q, family = q_family, data = data)
+  data$Q0W <- predict(Q_init, newdata = data.frame(T = 0, data[covariates]))
+  data$Q1W <- predict(Q_init, newdata = data.frame(T = 1, data[covariates]))
+  data$Q <- predict(Q_init, type = "response")
+  
+  f_offset <- function(x,condition){
+    ifelse(condition, logit(x), x)
+  }
+  
+  print(head(f_offset(data$Q, transforms)))
+  
+  if(outcome == 'binary'){
+    data$offset <- logit(data$Q)
+  }else if (transforms) {
+    data$offset <- logit(data$Q)
+  }else{
+    data$offset <- data$Q
+  }
+  
+  formula_g <- as.formula(paste("T ~ W1 + W2 + W3"))
+  g_init <- glm(formula_g, family = binomial, data = data)
+  data$g1W <- predict(g_init, type = "response")
+  
+  data$k_Q1 <- if (weight) 1 else 1 / data$g1W
+  data$k_Q0 <- if (weight) 1 else 1 / (1 - data$g1W)
+  
+  data$H <-if (weight) data$T - (1 - data$T) else (data$T / data$g1W) - ((1 - data$T) / (1 - data$g1W))
+  data$weights_single_H <- if (weight) ifelse(data$T == 1, 1 / data$g1W, 1 / (1 - data$g1W)) else 1
+  data$H1 <- if(weight) data$T else data$T / data$g1W
+  data$H0 <- if(weight) (1  - data$T) else ((1 - data$T) / (1 - data$g1W))
+  data$weights_H1 <- if (weight) 1 / data$g1W else 1
+  data$weights_H0 <- if (weight) 1 / (1 - data$g1W) else 1
+
+  if (use_single_H) {
+    second_stage <- glm2(data$Y ~ -1 + H + offset(data$offset), 
+                         family = update_family, data = data, weights = weights_single_H)
+    epsilon <- coef(second_stage)[1]
+    Q_star1 <- f_star(f_offset(data$Q1W, transforms) + epsilon * data$k_Q1)
+    Q_star0 <- f_star(f_offset(data$Q0W, transforms) - epsilon * data$k_Q0)
+  } else {
+    second_stage_1 <- glm2(data$Y ~ -1 + H1 + offset(data$offset), 
+                           family = update_family, data = data, weights = weights_H1)
+    second_stage_0 <- glm2(data$Y ~ -1 + H0 + offset(data$offset), 
+                           family = update_family, data = data, weights = weights_H0)
+    epsilon_1 <- coef(second_stage_1)[1]
+    epsilon_0 <- coef(second_stage_0)[1]
+    Q_star1 <- f_star(f_offset(data$Q1W, transforms) + epsilon_1 * data$k_Q1)
+    Q_star0 <- f_star(f_offset(data$Q0W, transforms) + epsilon_0 * data$k_Q0)
+  }
+  
+  if (all(data$Y %in% c(0, 1))) {
+    ATE_pre <- mean(data$Q1W - data$Q0W)
+    ATE <- mean(Q_star1 - Q_star0)
+} else if (transforms) {
+    ATE_pre <- mean(data$Q1W - data$Q0W) * (b - a)
+    ATE <- mean(Q_star1 - Q_star0) * (b - a)
+}else{
+    ATE_pre <- mean(data$Q1W - data$Q0W)
+    ATE <- mean(Q_star1 - Q_star0)
+}
+  
+  bias <- abs(ATE - true_value)
+  
+  if (all(data$Y %in% c(0, 1))) {
+    ATE_n <- ATE 
+} else if (transforms) {
+    ATE_n <- ATE/ (b - a)
+}else{
+  ATE_n <- ATE 
+}
+  data$H_n <- (data$T / data$g1W) - ((1 - data$T) / (1 - data$g1W))
+  data$H_1 <- data$T / data$g1W
+  data$H_0 <- (1 - data$T) / (1 - data$g1W)
+  
+  if(use_single_H){
+    IF <- data$H_n * (data$Y - (data$T * Q_star1 + (1 - data$T) * Q_star0)) + (Q_star1 - Q_star0) - ATE_n
+    IF_1 <- mean(data$H_n * (data$Y - (data$T * Q_star1 + (1 - data$T) * Q_star0)))
+    IF_0 <- mean((Q_star1 - Q_star0) - ATE_n)
+  }else{
+    IF <- data$H_1* (data$Y - Q_star1) - data$H_0 * (data$Y - Q_star0) + (Q_star1 - Q_star0) - ATE_n
+    IF_1 <- mean(data$H_1* (data$Y - Q_star1) - data$H_0 * (data$Y - Q_star0))
+    IF_0 <- mean((Q_star1 - Q_star0) - ATE_n)
+  }
+  
+  
+  n <- nrow(data)
+  SE <- if(transforms) sqrt(var(IF) / n) * (b - a) else sqrt(var(IF) / n)
+  z <- qnorm(1 - alpha / 2)
+  
+  CI_lower <- ATE - z * SE
+  CI_upper <- ATE + z * SE
+  MSE <- bias^2 + SE^2
+  
+  return(list(estimate = ATE, bias = bias, se = SE, mse = MSE, ci_lower = CI_lower, ci_upper = CI_upper))
+}
+
+result <- estimate_tmle(data3)
+print(result)
+```
+
+```{r}
+greedy_ctmle <- function(data, true_value = 1, alpha = 0.05) {
+  
+  logit <- function(p) {
+    p <- pmax(pmin(p, 0.999), 0.001)
+    return(log(p / (1 - p)))
+  }
+  
+  expit <- function(x) {
+    return(1 / (1 + exp(-x)))
+  }
+  
+  a <- min(data$Y)
+  b <- max(data$Y)
+  data$Y <- (data$Y - a) / (b - a)
+  covariates <- colnames(data)[grepl("^W", colnames(data))]
+  #formula_q <- as.formula(paste("Y ~ T +", paste(covariates, collapse = " + "), "+ T:(", paste(covariates, collapse = " + "), ")"))
+  #formula_q <- as.formula(paste("Y ~ T + W1 + W2 + W4 + W6+ W7"))
+  formula_q <-  as.formula(paste("Y ~ T + W1 +W2"))
+  Q_init <- glm(formula_q, family = gaussian, data = data)
+  data$Q0W <- predict(Q_init, newdata = data.frame(T = 0, data[covariates]))
+  data$Q1W <- predict(Q_init, newdata = data.frame(T = 1, data[covariates]))
+  data$Q <- predict(Q_init, type = "response")
+
+  selected_vars <- c()
+  remaining_vars <- covariates
+  min_loss <- Inf
+  best_g <- NULL
+  
+  for (k in 1:length(covariates)) {
+    losses <- c()
+    g_models <- list()
+    
+    for (cov_var in remaining_vars) {
+      vars_to_use <- c(selected_vars, cov_var)
+      formula_g <- as.formula(paste("T ~", paste(vars_to_use, collapse = " + ")))
+      g_model <- glm2(formula_g, family = binomial, data = data)
+      g1W <- predict(g_model, type = "response")
+      
+      data$H1 <- data$T 
+      data$H0 <- (1 - data$T) 
+      data$weights_H1 <-  1 / g1W 
+      data$weights_H0 <-  1 / (1 - g1W) 
+      
+      second_stage_1 <- glm2(data$Y ~ -1 + H1 + offset(logit(data$Q)), family = quasibinomial, data = data, weights = weights_H1)
+      second_stage_0 <- glm2(data$Y ~ -1 + H0 + offset(logit(data$Q)), family = quasibinomial, data = data, weights = weights_H0)
+      epsilon_1 <- coef(second_stage_1)[1]
+      epsilon_0 <- coef(second_stage_0)[1]
+      Q_star1 <- expit(logit(data$Q1W) + epsilon_1 )
+      Q_star0 <- expit(logit(data$Q0W) + epsilon_0 )
+      
+      loss <- mean((data$Y - (data$T * Q_star1 + (1 - data$T) * Q_star0))^2)
+      losses <- c(losses, loss)
+      
+      g_models[[cov_var]] <- list(g_model = g_model, loss = loss, g1W = g1W,
+                                  epsilon_1 = epsilon_1, epsilon_0 = epsilon_0,
+                                  Q_star1 = Q_star1, Q_star0 = Q_star0)
+      
+      #cat("\nIteration:", k, "| Testing Combination:", paste(vars_to_use, collapse = " + "), "| Loss:", loss, "\n")
+    }
+    best_var <- remaining_vars[which.min(losses)]
+    best_model <- g_models[[best_var]]
+    
+    if (best_model$loss < min_loss) {
+      min_loss <- best_model$loss
+      selected_vars <- c(selected_vars, best_var)
+      remaining_vars <- setdiff(remaining_vars, best_var)
+      best_g <- best_model$g_model
+      best_g1W <- best_model$g1W
+      epsilon_1 <- best_model$epsilon_1
+      epsilon_0 <- best_model$epsilon_0
+      Q_star1 <- best_model$Q_star1
+      Q_star0 <- best_model$Q_star0
+      best_combination <- selected_vars
+      
+      #cat("Selected combination so far:", paste(selected_vars, collapse = " + "), "| Updated min loss:", min_loss, "\n")
+    } else {
+      #cat("No improvement in loss, stopping selection.\n")
+      break
+    }
+  }
+  
+  cat("\nBest combination chosen:", paste(best_combination, collapse = " + "), "\n")
+  
+  ATE_pre <- mean(data$Q1W - data$Q0W) * (b - a)
+  ATE <- mean(Q_star1 - Q_star0) * (b - a)
+  ATE_n <- ATE/(b - a)
+  
+  data$H_1 <- data$T / best_g1W
+  data$H_0 <- (1 - data$T) / (1 - best_g1W)
+  IF <- (data$T / best_g1W) * (data$Y - Q_star1) - ((1 - data$T) / (1 - best_g1W)) * (data$Y - Q_star0) + (Q_star1 - Q_star0) - ATE_n
+  
+  IF_1 <- mean((data$T / best_g1W) * (data$Y - Q_star1) - ((1 - data$T) / (1 - best_g1W)) * (data$Y - Q_star0))
+  IF_0 <- mean((Q_star1 - Q_star0) - ATE_n)
+  SE <- sqrt(var(IF) / nrow(data)) * (b - a)
+  z <- qnorm(1 - alpha / 2)
+  CI_lower <- ATE - z * SE
+  CI_upper <- ATE + z * SE
+  bias <- abs(ATE - true_value)
+  MSE <- bias^2 + SE^2
+  
+  
+  return(list(estimate = ATE, bias = bias, se = SE, mse = MSE, ci_lower = CI_lower, ci_upper = CI_upper))
+}
+
+greedy_ctmle(data1)
+
+```
+
+```{r}
+sl_ctmle <- function(data, true_value = 1, alpha = 0.05) {
+  
+  covariates <- colnames(data)[grepl("^W", colnames(data))]
+  #formula_q <- as.formula(paste("Y ~ T +", paste(covariates, collapse = " + "), "+ T:(", paste(covariates, collapse = " + "), ")"))
+  #formula_q <- as.formula(paste("Y ~ T + W1 + W2 + W4 + W6+ W7"))
+  #formula_q <-  as.formula(paste("Y ~ T + W2 +W3 + W4"))
+  formula_q <-  as.formula(paste("Y ~ T + W1 +W2"))
+  #formula_q <-  as.formula(paste("Y ~ T"))
+  Q_init <- glm(formula_q, family = gaussian, data = data)
+  data$Q0W <- predict(Q_init, newdata = data.frame(T = 0, data[covariates]))
+  data$Q1W <- predict(Q_init, newdata = data.frame(T = 1, data[covariates]))
+  data$Q <- predict(Q_init, type = "response")
+
+  SL.library <- c("SL.glm", "SL.glmnet", "SL.randomForest", "SL.gam")
+  X <- data[, covariates]
+  Y_T <- data$T
+  
+  g_superlearner <- SuperLearner(Y = Y_T, X = X, family = binomial, SL.library = SL.library)
+  data$g1W <- g_superlearner$SL.predict
+
+  data$H1 <- data$T / data$g1W
+  data$H0 <- (1 - data$T) / (1 - data$g1W)
+  
+  second_stage_1 <- glm(data$Y ~ -1 + H1 + offset(data$Q), family = gaussian, data = data)
+  epsilon_1 <- coef(second_stage_1)[1]
+  second_stage_0 <- glm(data$Y ~ -1 + H0 + offset(data$Q), family = gaussian, data = data)
+  epsilon_0 <- coef(second_stage_0)[1]
+  
+  Q_star1 <- data$Q1W + epsilon_1 * (1 / data$g1W)
+  Q_star0 <- data$Q0W + epsilon_0 * (1 / (1 - data$g1W))
+
+  ATE <- mean(Q_star1 - Q_star0)
+  IF <- data$H1 * (data$Y - Q_star1) - data$H0 * (data$Y - Q_star0) + (Q_star1 - Q_star0) - ATE
+  SE <- sqrt(var(IF) / nrow(data))
+  z <- qnorm(1 - alpha / 2)
+  CI_lower <- ATE - z * SE
+  CI_upper <- ATE + z * SE
+  bias <- abs(ATE - true_value)
+  MSE <- bias^2 + SE^2
+  
+  print(mean(data$Q1W - data$Q0W))
+  return(list(estimate = ATE, bias = bias, se = SE, mse = MSE, ci_lower = CI_lower, ci_upper = CI_upper))
+}
+
+
+sl_ctmle(data1)
+
+```
+
+```{r}
+ctmle1 <- function(data, true_value = 1, alpha = 0.05) {
+  
+  covariates <- colnames(data)[grepl("^W", colnames(data))]
+  
+  
+  #formula_q <- as.formula(paste("Y ~ T +", paste(covariates, collapse = " + "), "+ T:(", paste(covariates, collapse = " + "), ")"))
+  formula_q <- as.formula(paste("Y ~ T + W1 + W2 + W4 + W6+ W7"))
+  #formula_q <-  as.formula(paste("Y ~ T + W2 +W3 + W4"))
+  #formula_q <-  as.formula(paste("Y ~ T + W1 +W2"))
+  #formula_q <-  as.formula(paste("Y ~ T"))
+  Q_init <- glm(formula_q, family = gaussian, data = data)
+  data$Q0W <- predict(Q_init, newdata = data.frame(T = 0, data[covariates]))
+  data$Q1W <- predict(Q_init, newdata = data.frame(T = 1, data[covariates]))
+  data$Q <- predict(Q_init, type = "response")
+  
+  formula_g <- paste("T ~", paste(covariates, collapse = " + "))
+  x <- model.matrix(as.formula(formula_g), data = data)
+  y <- data$T
+  
+  cv_glmnet <- cv.glmnet(x, y, alpha = 1, family = "binomial")
+  lambda_seq <- cv_glmnet$lambda 
+  best_lambda <- NULL
+  min_loss <- Inf
+  
+  for (lambda in lambda_seq) {
+    g_model <- glmnet(x, y, alpha = 1, family = "binomial", lambda = lambda)
+    g1W <- as.numeric(predict(g_model, newx = x, type = "response"))  
+    
+    data$H1 <- data$T / g1W
+    data$H0 <- (1 - data$T) / (1 - g1W)
+  
+    second_stage <- glm(data$Y ~ -1 + H1 + H0 + offset(data$Q), family = gaussian, data = data)
+    epsilon <- as.numeric(coef(second_stage))  
+    data$Q_star1 <- data$Q1W + epsilon[1] / g1W
+    data$Q_star0 <- data$Q0W - epsilon[1] / (1 - g1W)
+    
+    loss <- mean((data$Y - (data$T * data$Q_star1 + (1 - data$T) * data$Q_star0))^2)
+    
+    if (loss < min_loss) {
+      min_loss <- loss
+      best_lambda <- lambda
+      best_g1W <- g1W
+      Q_star1 <- data$Q_star1
+      Q_star0 <- data$Q_star0
+    }
+  }
+  
+  c <- coef(g_model, s =best_lambda)
+
+  ATE_pre <- mean(data$Q1W - data$Q0W)
+  ATE <- mean(Q_star1 - Q_star0)
+  IF <- (data$T / best_g1W) * (data$Y - Q_star1) - ((1 - data$T) / (1 - best_g1W)) * (data$Y - Q_star0) + (Q_star1 - Q_star0) - ATE
+  SE <- sqrt(var(IF) / nrow(data))
+  z <- qnorm(1 - alpha / 2)
+  CI_lower <- ATE - z * SE
+  CI_upper <- ATE + z * SE
+  bias <- abs(ATE - true_value)
+  MSE <- bias^2 + SE^2
+  print(ATE_pre)
+  
+  return(list(
+    estimate = unname(ATE),
+    bias = unname(bias),
+    se = unname(SE),
+    #coef = c,
+    mse = unname(MSE),
+    ci_lower = unname(CI_lower),
+    ci_upper = unname(CI_upper),
+    best_lambda = best_lambda
+  ))
+}
+
+ctmle1(data)
+```
+
+```{r}
+ctmle0 <- function(data, true_value = 1, alpha = 0.05) {
+  
+  covariates <- colnames(data)[grepl("^W", colnames(data))]
+  
+  #formula_q <- as.formula(paste("Y ~ T +", paste(covariates, collapse = " + "), "+ T:(", paste(covariates, collapse = " + "), ")"))
+  #formula_q <- as.formula(paste("Y ~ T + W1 + W2 + W4 + W6+ W7"))
+  #formula_q <-  as.formula(paste("Y ~ T + W2 +W3 + W4"))
+  formula_q <-  as.formula(paste("Y ~ T + W1 +W2"))
+  #formula_q <-  as.formula(paste("Y ~ T"))
+  Q_init <- glm(formula_q, family = gaussian, data = data)
+  data$Q0W <- predict(Q_init, newdata = data.frame(T = 0, data[covariates]))
+  data$Q1W <- predict(Q_init, newdata = data.frame(T = 1, data[covariates]))
+  data$Q <- predict(Q_init, type = "response")
+
+  formula_g <- paste("T ~", paste(covariates, collapse = " + "))
+  x <- model.matrix(as.formula(formula_g), data = data)
+  y <- data$T
+
+  cv_glmnet <- cv.glmnet(x, y, alpha = 1, family = "binomial")
+  lambda_seq <- cv_glmnet$lambda
+
+  best_lambda <- NULL
+  min_loss <- Inf
+  best_g1W <- NULL
+  best_Q_star1 <- NULL
+  best_Q_star0 <- NULL
+
+  for (lambda in lambda_seq) {
+    g_model <- glmnet(x, y, alpha = 1, family = "binomial", lambda = lambda)
+    g1W <- as.numeric(predict(g_model, newx = x, type = "response"))  
+
+    data$H <- data$T / g1W -((1 - data$T) / (1 - g1W))
+    
+    g_grad <- predict(g_model, newx = x, type = "link", s = lambda, exact = TRUE, grad = TRUE)
+    data$H_grad <- (1 - data$T) / (1 - g1W)^2 * (-g_grad) + data$T / g1W^2 * g_grad
+
+    second_stage <- glm(data$Y ~ -1 + H + H_grad + offset(data$Q), family = gaussian, data = data)
+    epsilon <- as.numeric(coef(second_stage)) 
+    data$Q_star1 <- data$Q1W + epsilon[1] / g1W + (epsilon[2]/ g1W^2) * g_grad
+    data$Q_star0 <- data$Q0W - epsilon[1] / (1 - g1W) + (epsilon[2]/ (1 - g1W)^2) * (-g_grad)
+   
+    loss <- mean((data$Y - (data$T * data$Q_star1 + (1 - data$T) * data$Q_star0))^2) 
+ 
+    if (loss < min_loss) {
+      min_loss <- loss
+      best_lambda <- lambda
+      best_g1W <- g1W
+      Q_star1 <- data$Q_star1
+      Q_star0 <- data$Q_star0
+    }
+  }
+  
+  c <- coef(g_model, s =best_lambda)
+
+  ATE_pre <- mean(data$Q1W - data$Q0W)
+  ATE <- mean(Q_star1 - Q_star0)
+  IF <- (data$T / best_g1W) * (data$Y - Q_star1) - ((1 - data$T) / (1 - best_g1W)) * (data$Y - Q_star0) + (Q_star1 - Q_star0) - ATE
+  SE <- sqrt(var(IF) / nrow(data))
+  z <- qnorm(1 - alpha / 2)
+  CI_lower <- ATE - z * SE
+  CI_upper <- ATE + z * SE
+  bias <- abs(ATE - true_value)
+  MSE <- bias^2 + SE^2
+
+  return(list(
+    estimate = unname(ATE),
+    bias = unname(bias),
+    se = unname(SE),
+    coef = c,
+    mse = unname(MSE),
+    ci_lower = unname(CI_lower),
+    ci_upper = unname(CI_upper),
+    best_lambda = best_lambda
+  ))
+}
+
+ctmle0(data1)
+```
+
+### TMLE & CTMLE Packages
+
+```{r}
+estimate_tmle_package <- function(data) {
+  covariates <- c(colnames(data)[grepl("^W", colnames(data))])
+  W <- as.matrix(data[, covariates])
+  result <- tmle(
+    Y = data$Y, 
+    A = data$T, 
+    W = W, 
+    Qform = "Y~A+W2+W3+W4",  
+    gform = "A~W1+W2+W3",              
+    family = "gaussian",         
+    verbose = FALSE
+  )
+  
+  ATE_tmle <- result$estimates$ATE$psi
+  SE_tmle <- result$estimates$ATE$var.psi^0.5
+  CI_tmle <- result$estimates$ATE$CI
+  bias_tmle <- abs(ATE_tmle - 1)
+  MSE <- bias_tmle^2 + SE_tmle^2
+  
+  return(list(estimate = ATE_tmle, bias = bias_tmle, se = SE_tmle, mse = MSE, ci_lower = CI_tmle[1], ci_upper = CI_tmle[2]))
+}
+
+estimate_tmle_package(data3)
+```
+
+```{r}
+tmle_ <- tmle(Y = data1$Y, A = data1$T, W = W,Q.SL.library = "SL.glm",g.SL.library = "SL.glm",g.Delta.SL.library =  "SL.glm", family = "gaussian" )
+
+summary(tmle_)
+```
+
+### Visualization
+
+```{r}
+estimators <- list(
+  DM = estimate_dm,
+  OLS = estimate_ols,
+  IPW = estimate_ipw,
+  IPW_Alternative = estimate_ipw_,
+  OSE = estimate_ose,
+  TMLE = estimate_tmle,
+  TMLE_PACKAGE = estimate_tmle_package,
+  Greedy_CTMLE = greedy_ctmle,
+  SL_CTMLE = sl_ctmle,
+  LASSO_CTMLE1 = ctmle1,
+  LASSO_CTMLE0 = ctmle0
+)
+
+evaluate_estimators <- function(data) {
+  results <- list()
+  
+  for (name in names(estimators)) {
+    estimator <- estimators[[name]]
+    
+    result <- estimator(data)
+    
+    results[[name]] <- data.frame(
+      Estimate = if ("estimate" %in% names(result)) result$estimate else NA,
+      SE = if ("se" %in% names(result)) result$se else NA,
+      CI_Lower = if ("ci_lower" %in% names(result)) result$ci_lower else NA,
+      CI_Upper = if ("ci_upper" %in% names(result)) result$ci_upper else NA,
+      Bias = if ("bias" %in% names(result)) result$bias else NA,
+      MSE = if ("mse" %in% names(result)) result$mse else NA
+    )
+  }
+  
+  results_df <- do.call(rbind, results)
+  results_df$Algorithm <- rownames(results_df)
+  rownames(results_df) <- NULL 
+  results_df <- results_df[, c("Algorithm", "Estimate", "SE", "CI_Lower", "CI_Upper", "Bias", "MSE")]
+  return(results_df)
+}
+
+results_table <- evaluate_estimators(data1)
+print(results_table)
+```
+
+```{r}
+print(colnames(results_table))
+
+```
+
+```{r}
+results_table$Algorithm <- factor(results_table$Algorithm, levels = rev(results_table$Algorithm))
+
+true_value <- 1
+ggplot(results_table, aes(x = Algorithm, y = Estimate)) +
+  geom_point(size = 3) + 
+  geom_errorbar(aes(ymin = CI_Lower, ymax = CI_Upper), width = 0.2) + 
+  geom_hline(yintercept = true_value, color = "green", linetype = "dashed") +  
+  coord_flip() +  
+  labs(
+    title = "ATE Estimates by Algorithm",
+    x = "Algorithm",
+    y = "Estimates"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text = element_text(size = 12),
+    axis.title = element_text(size = 14)
+  )
+
+```
+
+```{r}
+library(viridis)
+
+true_value <- 1
+
+ggplot(results_table, aes(x = Algorithm, y = Estimate)) +
+  geom_errorbar(aes(ymin = CI_Lower, ymax = CI_Upper, color = Algorithm), width = 0.2, show.legend = FALSE) + geom_point(size = 3) +
+  geom_hline(yintercept = true_value, color = "black", linetype = "dashed") +  
+  coord_flip() +  
+  labs(
+    title = expression(paste("Well-specified model for ", bar(Q)[0])),
+    x = "Algorithm",
+    y = "Estimates"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text = element_text(size = 12),
+    axis.title = element_text(size = 14)
+  ) +
+  scale_color_viridis_d() 
+
+
+```
