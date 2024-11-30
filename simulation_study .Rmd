@@ -24,10 +24,10 @@ library(glmnet)
 set.seed(123)   
 ```
 
-### Fixed Data
+### Old SImulation
 
 ```{r}
-fixed_data <- read.csv("data.csv")
+fixed_data <- read.csv("data.csv") #true value -4.480777
 fixed_data$X <- NULL
 summary(fixed_data)
 ```
